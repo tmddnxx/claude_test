@@ -4,291 +4,237 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 1. 프로젝트 개요
 
-NestJS 기반 모놀리식 백엔드 프로젝트. 도메인별 엄격한 모듈 분리를 적용하며, 계층형 아키텍처(Layered Architecture)와 도메인 주도 설계(DDD) 원칙을 따른다.
-모든 명령어는 `nest-project/` 디렉토리에서 실행한다.
+**KNOU Lecture Summarizer** — 한국방송통신대학교(KNOU) U-캠퍼스 강의를 자동으로 수집하고 요약하는 NestJS 백엔드.
+Playwright로 U-캠퍼스에 로그인하여 강의 영상의 m3u8 스트림 URL을 캡처하고, FFmpeg → faster-whisper → Claude CLI 파이프라인으로 오디오 추출 → 음성 인식 → 요약 마크다운 생성까지 자동 처리한다.
+
+**모든 명령어는 `nest-project/` 디렉토리에서 실행한다.**
 
 ## 2. 기술 스택
 
 | 항목 | 버전/도구 |
 |------|-----------|
-| Runtime | Node.js 20.20.0 |
-| Framework | NestJS 11.0.16 |
+| Runtime | Node.js 20+ |
+| Framework | NestJS 11 |
 | Language | TypeScript (strict) |
-| Database | PostgreSQL |
-| ORM | TypeORM |
+| 브라우저 자동화 | Playwright (Chromium) |
+| 오디오 추출 | FFmpeg (m3u8 → WAV, 16kHz mono) |
+| 음성 인식 | faster-whisper (Python venv, `scripts/transcribe.py`) |
+| 요약 | Claude CLI (`claude -p`) |
 | Validation | class-validator, class-transformer |
-| API 문서 | Swagger (개발 환경 전용) |
-| 테스트 | Jest, supertest |
 
-## 3. 아키텍처
+**DB 없음** — 현재 데이터베이스를 사용하지 않는다. 결과물은 파일시스템(`./summarize/`)에 마크다운으로 저장한다.
 
-**모놀리식 + 도메인별 모듈 분리 + 계층형 아키텍처**
+## 3. 파이프라인 동작 흐름
 
-요청 흐름:
+```
+POST /lecture/summarize { courseId, lectureNumber }
+    │
+    ├─ 1. PlaywrightBrowserAdapter
+    │     로그인(ucampus) → 학습현황 → 과목 펼치기 → 강의보기 클릭
+    │     → 팝업에서 .m3u8 URL 캡처 (네트워크 응답 감시)
+    │
+    ├─ 2. FfmpegAudioExtractorAdapter
+    │     m3u8 스트림 → WAV (pcm_s16le, 16kHz, mono)
+    │     임시 파일: ./temp/lecture-{uuid}/{uuid}.wav
+    │
+    ├─ 3. WhisperTranscriberAdapter
+    │     Python venv의 faster-whisper 호출 (scripts/transcribe.py)
+    │     stderr 진행률 → NestJS 로그로 실시간 출력
+    │
+    ├─ 4. ClaudeSummarizerAdapter
+    │     `claude -p` CLI로 트랜스크립트 요약
+    │
+    └─ 5. FsFileWriterAdapter
+          ./summarize/{과목명}/{강의제목}.md 저장
+```
+
+## 4. 아키텍처
+
+**계층형 + 포트-어댑터(헥사고날) 패턴**
 
 ```
 Controller → Application(Service) → Domain → Infrastructure
 ```
 
-- **Controller**: HTTP 요청/응답 처리만 담당. 비즈니스 로직 금지.
-- **Application (Service)**: 도메인 로직을 조합(orchestrate)하고 트랜잭션을 관리한다.
-- **Domain**: 비즈니스 규칙과 핵심 로직이 존재하는 유일한 계층. 엔티티, 값 객체, 도메인 서비스 포함.
-- **Infrastructure**: 데이터베이스 접근, 외부 시스템 연동. TypeORM 리포지토리는 이 계층에서만 사용한다.
+- **Controller**: HTTP 요청/응답만 처리. 비즈니스 로직 금지.
+- **Application**: 파이프라인 오케스트레이션 (`LecturePipelineService`).
+- **Domain**: 값 객체(VO), 커스텀 예외, DI 토큰. 프레임워크 무의존.
+- **Infrastructure**: Playwright, FFmpeg, Whisper, Claude, 파일시스템 어댑터.
 
-## 4. 계층별 책임
+**포트(인터페이스) → 어댑터(구현체)** 패턴으로 외부 의존성을 추상화:
 
-| 계층 | 책임 | 금지 사항 |
-|------|------|-----------|
-| Controller | 요청 파싱, DTO 유효성 검증, 응답 반환 | 비즈니스 로직, DB 직접 접근 |
-| Application | 유스케이스 실행, 트랜잭션 관리, 도메인 서비스 호출 | DB 직접 접근, HTTP 관련 코드 |
-| Domain | 비즈니스 규칙, 엔티티 행위, 도메인 이벤트 | 프레임워크 의존, DB 직접 접근 |
-| Infrastructure | TypeORM 리포지토리 구현, 외부 API 호출 | 비즈니스 로직 |
+| 포트 (application/ports/) | 어댑터 (infrastructure/adapters/) | DI 토큰 |
+|---------------------------|-----------------------------------|---------|
+| `IBrowserPort` | `PlaywrightBrowserAdapter` | `BROWSER_PORT` |
+| `IAudioExtractorPort` | `FfmpegAudioExtractorAdapter` | `AUDIO_EXTRACTOR_PORT` |
+| `ITranscriberPort` | `WhisperTranscriberAdapter` | `TRANSCRIBER_PORT` |
+| `ISummarizerPort` | `ClaudeSummarizerAdapter` | `SUMMARIZER_PORT` |
+| `IFileWriterPort` | `FsFileWriterAdapter` | `FILE_WRITER_PORT` |
 
-## 5. DDD 구조 규칙
+DI 토큰은 `domain/constants/injection-tokens.ts`에서 `Symbol()`로 정의한다.
 
-- 각 도메인은 독립 NestJS 모듈로 구성한다.
-- 도메인 간 의존은 인터페이스(포트)를 통해서만 허용한다.
-- Aggregate Root를 통해서만 하위 엔티티에 접근한다.
-- 도메인 계층은 NestJS, TypeORM 등 프레임워크에 의존하지 않는다.
-- 리포지토리는 도메인 계층에서 인터페이스를 정의하고, Infrastructure 계층에서 구현한다.
-
-## 6. 폴더 구조 컨벤션
+## 5. 폴더 구조
 
 ```
-src/
-├── main.ts
-├── app.module.ts
-├── common/                          # 공유 유틸, 데코레이터, 인터셉터, 필터
-│   ├── decorators/
-│   ├── filters/
-│   ├── interceptors/
-│   ├── guards/
-│   └── types/
-├── config/                          # 환경변수 설정
-└── modules/
-    └── {domain}/                    # 도메인별 모듈
-        ├── {domain}.module.ts
-        ├── controller/
-        │   └── {domain}.controller.ts
-        ├── application/
-        │   └── {domain}.service.ts
-        ├── domain/
-        │   ├── entities/
-        │   ├── value-objects/
-        │   ├── interfaces/          # 리포지토리 인터페이스(포트)
-        │   └── services/            # 도메인 서비스
-        ├── infrastructure/
-        │   └── repositories/        # TypeORM 리포지토리 구현체
-        └── dto/
-            ├── request/
-            └── response/
+nest-project/
+├── scripts/
+│   └── transcribe.py                        # faster-whisper 트랜스크립션 (Python)
+├── temp/                                    # 파이프라인 실행 중 임시 파일 (자동 삭제)
+│   └── lecture-{uuid}/
+│       └── {uuid}.wav
+├── summarize/                               # 최종 요약 결과물 (OUTPUT_DIR)
+│   ├── 데이터베이스시스템/
+│   │   └── 1강_데이터베이스의_이해.md
+│   └── 알고리즘/
+│       └── ...
+├── src/
+│   ├── main.ts
+│   ├── app.module.ts
+│   ├── common/
+│   │   ├── filters/                         # 전역 예외 필터
+│   │   ├── interceptors/                    # API 응답 포맷 인터셉터
+│   │   └── types/
+│   └── modules/
+│       └── lecture/
+│           ├── lecture.module.ts
+│           ├── controller/
+│           │   └── lecture.controller.ts
+│           ├── application/
+│           │   ├── lecture-pipeline.service.ts
+│           │   └── ports/                   # 포트 인터페이스 5개
+│           ├── domain/
+│           │   ├── constants/               # injection-tokens.ts (Symbol DI 토큰)
+│           │   ├── exceptions/              # 도메인 예외 6개
+│           │   └── value-objects/           # VO 6개 (StreamUrl, AudioFilePath, Transcript 등)
+│           ├── infrastructure/
+│           │   ├── adapters/                # 어댑터 구현체 5개
+│           │   └── helpers/
+│           │       ├── temp-file-manager.ts # 프로젝트 상대 경로 ./temp/ 사용
+│           │       └── process-runner.ts    # spawn 래퍼 (타임아웃, onStderr 콜백)
+│           └── dto/
+│               ├── request/
+│               └── response/
+└── .env
 ```
 
-## 7. 코딩 컨벤션
+## 6. API 엔드포인트
 
-- **Prettier**: 작은따옴표, trailing comma `all`
-- **ESLint**: flat config (`eslint.config.mjs`), typescript-eslint 타입 체크 규칙 적용
-- `any` 타입 사용 금지 — 반드시 명시적 타입 또는 제네릭을 사용한다.
-- 모든 비동기 처리는 `async/await`만 사용한다 (콜백, `.then()` 체인 금지).
-- 한 파일에 하나의 클래스만 정의한다.
+| 메서드 | 경로 | 설명 |
+|--------|------|------|
+| `GET` | `/lecture/courses` | 수강 과목 목록 조회 |
+| `GET` | `/lecture/courses/:courseId/lectures` | 과목별 강의 목록 조회 |
+| `POST` | `/lecture/summarize` | 강의 요약 실행 (body: `{ courseId, lectureNumber }`) |
 
-## 8. DTO 규칙
+## 7. 환경변수 (.env)
 
-- 요청 DTO와 응답 DTO를 분리한다 (`dto/request/`, `dto/response/`).
-- 요청 DTO는 `class-validator` 데코레이터로 유효성을 검증한다.
-- 응답 DTO는 `class-transformer`의 `Exclude`/`Expose`로 직렬화를 제어한다.
-- 엔티티를 직접 응답으로 반환하지 않는다 — 반드시 응답 DTO로 변환한다.
-
-```typescript
-// 요청 DTO 예시
-export class CreateUserRequestDto {
-  @IsString()
-  @IsNotEmpty()
-  name: string;
-
-  @IsEmail()
-  email: string;
-}
-```
-
-## 9. 엔티티 규칙
-
-모든 엔티티는 다음 베이스 컬럼을 포함하는 추상 클래스를 상속한다:
-
-```typescript
-export abstract class BaseEntity {
-  @PrimaryGeneratedColumn('uuid')
-  id: string;
-
-  @CreateDateColumn({ name: 'created_at' })
-  createdAt: Date;
-
-  @UpdateDateColumn({ name: 'updated_at' })
-  updatedAt: Date;
-
-  @DeleteDateColumn({ name: 'deleted_at' })
-  deletedAt: Date | null;
-}
-```
-
-- 삭제는 소프트 딜리트(`@DeleteDateColumn`)를 기본으로 한다.
-- 엔티티 내부에 비즈니스 메서드를 정의하여 Anemic Domain Model을 피한다.
-- 컬럼명은 `snake_case`, 프로퍼티명은 `camelCase`를 사용한다.
-
-## 10. 리포지토리 규칙
-
-- 도메인 계층에 인터페이스를 정의한다:
-
-```typescript
-// domain/interfaces/user.repository.interface.ts
-export interface IUserRepository {
-  findById(id: string): Promise<User | null>;
-  save(user: User): Promise<User>;
-}
-```
-
-- Infrastructure 계층에서 TypeORM으로 구현하고, NestJS DI 토큰으로 주입한다.
-- 리포지토리 구현체 외부에서 `QueryBuilder`를 직접 사용하지 않는다.
-
-## 11. 트랜잭션 규칙
-
-- 여러 Aggregate를 수정하는 작업은 반드시 트랜잭션으로 감싼다.
-- 트랜잭션은 Application(Service) 계층에서 관리한다.
-- `DataSource.transaction()` 또는 `QueryRunner`를 사용한다.
-
-```typescript
-async transferPoints(fromId: string, toId: string, amount: number): Promise<void> {
-  await this.dataSource.transaction(async (manager) => {
-    // 트랜잭션 내에서 여러 aggregate 조작
-  });
-}
-```
-
-## 12. API 응답 표준
-
-모든 API는 통일된 응답 포맷을 사용한다:
-
-```typescript
-// 성공
-{
-  "success": true,
-  "data": { ... },
-  "meta": { "timestamp": "2024-01-01T00:00:00.000Z" }
-}
-
-// 실패
-{
-  "success": false,
-  "error": {
-    "code": "USER_NOT_FOUND",
-    "message": "사용자를 찾을 수 없습니다."
-  },
-  "meta": { "timestamp": "2024-01-01T00:00:00.000Z" }
-}
-```
-
-- 페이지네이션이 필요한 목록 API는 `meta`에 `page`, `limit`, `totalCount`를 포함한다.
-- HTTP 상태 코드를 정확히 사용한다 (200, 201, 400, 401, 403, 404, 409, 500).
-
-## 13. 에러 처리 규칙
-
-- 도메인 에러는 커스텀 예외 클래스로 정의한다 (`DomainException` 상속).
-- 전역 `ExceptionFilter`에서 도메인 예외를 HTTP 응답으로 변환한다.
-- 예외에는 고유한 에러 코드(`string`)를 부여한다 (예: `USER_NOT_FOUND`, `INVALID_ORDER_STATE`).
-- 예상하지 못한 에러는 500으로 응답하되, 내부 상세 정보를 클라이언트에 노출하지 않는다.
-
-## 14. 로깅 규칙
-
-- NestJS 내장 `Logger`를 사용한다.
-- 각 클래스에서 `private readonly logger = new Logger(ClassName.name)`으로 인스턴스를 생성한다.
-- 로그 레벨: `error` (장애), `warn` (경고), `log` (주요 흐름), `debug` (개발용 상세).
-- 민감 정보(비밀번호, 토큰 등)는 로그에 기록하지 않는다.
-
-## 15. 환경변수 구조
-
-`@nestjs/config`의 `ConfigModule`을 사용하며, `.env` 파일로 관리한다:
-
-```
-# 서버
+```env
 PORT=3000
 NODE_ENV=development
 
-# 데이터베이스
-DB_HOST=localhost
-DB_PORT=5432
-DB_USERNAME=postgres
-DB_PASSWORD=
-DB_DATABASE=app_dev
+# KNOU U-캠퍼스
+LECTURE_LOGIN_URL=https://ucampus.knou.ac.kr/ekp/user/login/retrieveULOLogin.do
+LECTURE_STUDY_URL=https://ucampus.knou.ac.kr/ekp/user/study/retrieveUMYStudy.sdo
+LECTURE_USERNAME=<학번>
+LECTURE_PASSWORD=<비밀번호>
 
-# JWT (필요 시)
-JWT_SECRET=
-JWT_EXPIRES_IN=3600
+# 타임아웃 (ms)
+BROWSER_TIMEOUT_MS=30000
+FFMPEG_TIMEOUT_MS=600000
+WHISPER_TIMEOUT_MS=3600000      # 1시간 (긴 강의 대비)
+CLAUDE_TIMEOUT_MS=120000
+
+# faster-whisper
+VENV_PATH=../venv                # Python venv 경로 (nest-project 기준 상대경로)
+WHISPER_MODEL=small              # tiny/base/small/medium/large-v3
+
+# 출력
+OUTPUT_DIR=./summarize
 ```
 
-- 환경변수는 `ConfigService`를 통해서만 접근한다 (`process.env` 직접 참조 금지, `main.ts` 제외).
+`ConfigService`를 통해서만 접근한다 (`process.env` 직접 참조 금지, `main.ts` 제외).
 
-## 16. 데이터베이스 규칙
+## 8. 핵심 구현 상세
 
-- 테이블명은 `snake_case` 복수형으로 한다 (예: `users`, `order_items`).
-- 외래 키 컬럼명은 `{관계}_id` 형식으로 한다 (예: `user_id`).
-- 인덱스는 자주 조회하는 컬럼과 외래 키에 명시적으로 추가한다.
-- `synchronize: true`는 프로덕션에서 절대 사용하지 않는다.
+### KNOU 로그인 (PlaywrightBrowserAdapter)
+- URL: `LECTURE_LOGIN_URL` (ucampus.knou.ac.kr)
+- 폼 필드: `#username`, `#password`
+- 로그인 트리거: `page.evaluate(() => actionLogin())` — JS 함수 호출
+- **주의**: 로그인 시 페이지 네비게이션이 발생하므로 `Promise.all([waitForNavigation, evaluate])` 패턴 필수
 
-## 17. 마이그레이션 정책
+### m3u8 캡처
+- 과목 펼치기: `#btn-toggle-{courseId}` 클릭
+- 강의보기 클릭 → 팝업 열림 (`context.once('page')`)
+- 팝업의 네트워크 응답에서 `.m3u8` URL 감시
+- 제작중인 강의는 `span.con-waiting` 존재 여부로 판단
 
-- 스키마 변경은 반드시 TypeORM 마이그레이션 파일로 관리한다.
-- 마이그레이션 파일명은 타임스탬프 기반으로 자동 생성한다.
+### faster-whisper 연동
+- `scripts/transcribe.py`를 Python venv 바이너리로 실행
+- `process-runner.ts`의 `onStderr` 콜백으로 진행률 실시간 로깅
+- VAD 필터 활성화, 모델은 `WHISPER_MODEL` 환경변수로 제어
+
+### 임시 파일 관리 (TempFileManager)
+- NestJS 싱글턴 — 프로젝트 상대 경로 `./temp/lecture-{uuid}/` 사용
+- `cleanup()` 후에도 `createTempPath()` 호출 시 디렉토리 자동 재생성
+- 파이프라인 완료 후 `finally` 블록에서 자동 정리
+
+## 9. 코딩 컨벤션
+
+- **Prettier**: 작은따옴표, trailing comma `all`, 4칸 들여쓰기
+- **ESLint**: flat config (`eslint.config.mjs`)
+- `any` 타입 사용 금지
+- `async/await`만 사용 (콜백, `.then()` 금지)
+- 한 파일에 하나의 클래스
+- 포트 인터페이스는 `import type`으로 임포트 (decorated constructor parameter + `isolatedModules` 호환)
+
+### 네이밍 컨벤션
+
+| 대상 | 규칙 | 예시 |
+|------|------|------|
+| 클래스 | PascalCase | `LecturePipelineService` |
+| 파일 | kebab-case | `lecture-pipeline.service.ts` |
+| 변수/함수 | camelCase | `fetchCourses` |
+| 환경변수 | UPPER_SNAKE_CASE | `WHISPER_MODEL` |
+| 인터페이스 | `I` 접두사 | `IBrowserPort` |
+| DTO | `{Action}{Domain}{Request/Response}Dto` | `SummarizeLectureRequestDto` |
+| 값 객체 파일 | `{name}.vo.ts` | `stream-url.vo.ts` |
+| 예외 파일 | `{name}.exception.ts` | `transcription.exception.ts` |
+
+## 10. 빌드 및 실행
 
 ```bash
-# 마이그레이션 생성
-npx typeorm migration:generate src/migrations/{MigrationName} -d src/config/data-source.ts
+cd nest-project
 
-# 마이그레이션 실행
-npx typeorm migration:run -d src/config/data-source.ts
+# 의존성 설치
+npm install
+npx playwright install chromium
 
-# 마이그레이션 롤백
-npx typeorm migration:revert -d src/config/data-source.ts
+# Python venv (faster-whisper)
+python3 -m venv ../venv
+source ../venv/bin/activate
+pip install faster-whisper
+
+# 개발 모드
+npm run start:dev
+
+# 프로덕션
+npm run build
+npm run start:prod
 ```
 
-- 마이그레이션은 롤백 가능하도록 `up()`과 `down()`을 모두 구현한다.
-- 데이터 손실이 발생하는 마이그레이션(컬럼 삭제 등)은 단계적으로 진행한다.
+## 11. 알려진 주의사항
 
-## 18. 네이밍 컨벤션
+- **FFmpeg, Claude CLI** 가 시스템 PATH에 있어야 한다.
+- Whisper `large-v3` 모델은 1시간 강의 기준 매우 오래 걸림 → `small` 모델 권장.
+- `TempFileManager`는 싱글턴이므로 동시 요청 시 temp 디렉토리 충돌 가능성 있음.
+- Playwright는 headless 모드로 실행 — U-캠퍼스 구조 변경 시 셀렉터 업데이트 필요.
+- `scripts/transcribe.py`의 `batch_size=8`은 RAM 16GB 기준 적절. GPU 없으면 `compute_type="int8"` 사용.
 
-| 대상 | 규칙                                      | 예시 |
-|------|-----------------------------------------|------|
-| 클래스 | PascalCase                              | `UserService`, `CreateOrderRequestDto` |
-| 파일 | kebab-case                              | `user.service.ts`, `create-order.request.dto.ts` |
-| 변수/함수 | camelCase                               | `findById`, `orderCount` |
-| DB 테이블 | snake_case 단수형                          | `user`, `order_item` |
-| DB 컬럼 | snake_case                              | `created_at`, `user_id` |
-| 환경변수 | UPPER_SNAKE_CASE                        | `DB_HOST`, `JWT_SECRET` |
-| 인터페이스 | `I` 접두사 + PascalCase                    | `IUserRepository` |
-| DTO | `{Action}{Domain}{Request/Response}Dto` | `CreateUserRequestDto` |
-
-## 19. 테스트 전략
-
-```bash
-npm test                                        # 전체 단위 테스트
-npm test -- --testPathPattern=user.service       # 단일 파일 테스트
-npm run test:e2e                                 # E2E 테스트
-npm run test:cov                                 # 커버리지 리포트
-```
-
-- **단위 테스트** (`*.spec.ts`): 소스 파일과 같은 디렉토리에 배치. 도메인 로직과 서비스 중심으로 작성.
-- **E2E 테스트** (`test/*.e2e-spec.ts`): supertest로 API 엔드포인트 검증.
-- 외부 의존성(DB, 외부 API)은 모킹한다.
-- 테스트에서 실제 DB 연결이 필요한 경우 별도 테스트 DB를 사용한다.
-
-## 20. 금지 사항
+## 12. 금지 사항
 
 - Controller에 비즈니스 로직 작성
-- Domain 계층에서 프레임워크(NestJS, TypeORM) 직접 의존
+- Domain 계층에서 NestJS 프레임워크 직접 의존
 - `any` 타입 사용
-- `synchronize: true` 프로덕션 사용
-- 엔티티 직접 응답 반환 (DTO 변환 필수)
 - `process.env` 직접 참조 (`main.ts` 제외)
-- 콜백 또는 `.then()` 체인 사용 (`async/await`만 허용)
-- Infrastructure 계층 외부에서 TypeORM 리포지토리 직접 사용
-- Swagger를 프로덕션에서 활성화
-- 마이그레이션 없이 스키마 변경
+- 콜백 또는 `.then()` 체인
+- Infrastructure 계층 외부에서 외부 시스템 직접 호출
+- rm -rf 등 동의 없는 삭제
